@@ -15,9 +15,8 @@ from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.loss import LossFunction
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.components.validate import iterate_and_close_dataloader, Validator
-from torchtitan.config import ParallelismConfig
-from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.distributed.context_parallel import ContextParallelPartitioner
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import context_parallel, ParallelDims, utils as dist_utils
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.protocols.model import BaseModel
 
@@ -128,7 +127,7 @@ class FluxValidator(Validator):
         clip_encoder: FluxEmbedder,
         dump_folder: str,
     ):
-        self.device = device
+        self._device = device
         self._dtype = _dtype
         self.autoencoder = autoencoder
         self.t5_encoder = t5_encoder
@@ -169,7 +168,7 @@ class FluxValidator(Validator):
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
-            input_dict = microbatch.to_input_dict(self.device)
+            input_dict = microbatch.to_input_dict(self._device)
             labels = input_dict.pop("labels")
             prompt = input_dict.pop("prompt")
             if not isinstance(prompt, list):
@@ -181,7 +180,7 @@ class FluxValidator(Validator):
                     break
                 with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
                     image = generate_image(
-                        device=self.device,
+                        device=self._device,
                         dtype=self._dtype,
                         img_height=img_height,
                         img_width=img_width,
@@ -216,7 +215,7 @@ class FluxValidator(Validator):
             # generate t5 and clip embeddings
             input_dict["image"] = labels
             input_dict = preprocess_data(
-                device=self.device,
+                device=self._device,
                 dtype=self._dtype,
                 autoencoder=self.autoencoder,
                 clip_encoder=self.clip_encoder,
@@ -234,7 +233,7 @@ class FluxValidator(Validator):
                 stratified_timesteps = torch.tensor(
                     [1 / 8 * (i + 0.5) for i in range(8)],
                     dtype=torch.float32,
-                    device=self.device,
+                    device=self._device,
                 ).repeat(bsz)
                 clip_encodings = clip_encodings.repeat_interleave(8, dim=0)
                 t5_encodings = t5_encodings.repeat_interleave(8, dim=0)
@@ -249,7 +248,7 @@ class FluxValidator(Validator):
             self.metrics_processor.ntokens_since_last_log += labels.numel()
 
             # Apply timesteps here and update our bsz to efficiently compute all timesteps and samples in a single forward pass
-            with torch.no_grad(), torch.device(self.device):
+            with torch.no_grad(), torch.device(self._device):
                 noise = torch.randn_like(labels)
                 timesteps = stratified_timesteps.to(labels)
                 sigmas = timesteps.view(-1, 1, 1, 1)
@@ -258,7 +257,7 @@ class FluxValidator(Validator):
             bsz, _, latent_height, latent_width = latents.shape
 
             POSITION_DIM = 3  # constant for Flux flow model
-            with torch.no_grad(), torch.device(self.device):
+            with torch.no_grad(), torch.device(self._device):
                 # Create positional encodings
                 latent_pos_enc = create_position_encoding_for_latents(
                     bsz, latent_height, latent_width, POSITION_DIM
@@ -278,15 +277,31 @@ class FluxValidator(Validator):
                     "txt_ids": text_pos_enc,
                     "target": target,
                 }
-                partitioner = ContextParallelPartitioner(
-                    input_dict=cp_inputs,
-                    input_shardings=flux_input_sharding(),
-                    cp_mesh=parallel_dims.get_mesh("cp"),
-                    load_balancer_config=(
+                input_sharding = flux_input_sharding()
+                with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
+                    load_balancer_config = (
                         self.parallelism.context_parallel_load_balancer
-                    ),
-                )
-                cp_inputs = partitioner.shard_inputs(cp_inputs)
+                    )
+                    load_balancer = (
+                        load_balancer_config.build(
+                            seq_len=context_parallel.get_cp_input_seq_len(
+                                cp_inputs, input_shardings=input_sharding
+                            ),
+                            attention_metadata=None,
+                        )
+                        if load_balancer_config is not None
+                        else None
+                    )
+                    permutation = (
+                        load_balancer.generate_permutation()
+                        if load_balancer is not None
+                        else None
+                    )
+                    cp_inputs = context_parallel.shard_tensors(
+                        cp_inputs,
+                        input_shardings=input_sharding,
+                        permutation=permutation,
+                    )
                 latents = cp_inputs["img"]
                 latent_pos_enc = cp_inputs["img_ids"]
                 t5_encodings = cp_inputs["txt"]
